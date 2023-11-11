@@ -1,0 +1,723 @@
+#include "allocator.h"
+
+#include <stdatomic.h>
+#include <stdbool.h>
+
+#ifndef BADGEROS_KERNEL
+#include <stdio.h>
+#endif
+
+#define SKIPLIST_MAX_LEVEL 10
+#define RANGE_MAGIC 0XC0DECAFE
+
+// These are kind of large, but they exist in free memory
+typedef struct {
+    atomic_uint_least32_t magic; // Used as a flag to prevent double use
+    atomic_uint_least32_t level; // The current level of the node
+    atomic_size_t start;         // Start of this range (as a page index)
+    atomic_size_t size;          // Number of pages in this range
+    atomic_uintptr_t next[SKIPLIST_MAX_LEVEL]; // Forward pointers for coalescing skiplist
+    atomic_uintptr_t prev[SKIPLIST_MAX_LEVEL]; // Back pointers for coalescing skiplist
+    atomic_uintptr_t next_size[SKIPLIST_MAX_LEVEL]; // Forward pointers for size skiplist
+    atomic_uintptr_t prev_size[SKIPLIST_MAX_LEVEL]; // Back pointers for size skiplist
+} range_node_t;
+
+typedef struct {
+    range_node_t head;
+    atomic_flag write_lock;     // We can support arbitarily many readers, but only one writer
+} skiplist_t;
+
+static atomic_size_t       free_pages;
+static bitmap_word_atomic *page_bitmap;
+static skiplist_t          free_ranges = { .head = {0}, .write_lock = ATOMIC_FLAG_INIT };
+
+static size_t              pages;
+static size_t              page_bitmap_size;
+static uint8_t            *page_table;
+static uint8_t            *mem_start;
+static uint8_t            *mem_end;
+static uint8_t            *pages_start;
+static uint8_t            *pages_end;
+
+/* A comment to unconfuse clang-format */
+
+static inline bool page_bitmap_get_bit(const bitmap_word word, uint8_t bit_index) {
+    return (word & ((bitmap_word)1 << bit_index)) != 0;
+}
+
+static inline bitmap_word page_bitmap_set_bit(const bitmap_word word, uint8_t bit_index) {
+    return word | ((bitmap_word)1 << bit_index);
+}
+
+static inline bitmap_word page_bitmap_clear_bit(const bitmap_word word, uint8_t bit_index) {
+    return word & ~((bitmap_word)1 << bit_index);
+}
+
+size_t get_free_pages() {
+    return atomic_load(&free_pages);
+}
+
+size_t get_pages() {
+    return pages;
+}
+
+bitmap_word *get_page_bitmap() {
+    return (bitmap_word *)page_bitmap;
+}
+
+size_t get_page_bitmap_size() {
+    return page_bitmap_size;
+}
+
+uint8_t is_page_free_idx(size_t page_index) {
+    uint32_t    word_index = page_index / BITMAP_WORD_BITS;
+    uint8_t     bit_index  = page_index % BITMAP_WORD_BITS;
+
+    bitmap_word word       = atomic_load(&page_bitmap[word_index]);
+    return page_bitmap_get_bit(word, bit_index);
+}
+
+uint8_t is_page_free(void *ptr) {
+    size_t page_index = get_page_index(ptr);
+    return is_page_free_idx(page_index);
+}
+
+static inline uint8_t type_data_pack(uint8_t type, uint8_t data) {
+    type = type & 0x0F;
+    data = data & 0x0F;
+
+    return (type << 4) | data;
+}
+
+static inline uint8_t type_data_get_type(uint8_t packed) {
+    return (packed >> 4) & 0x0F;
+}
+
+static inline uint8_t type_data_get_data(uint8_t packed) {
+    return packed & 0x0F;
+}
+
+uint8_t get_page_type(size_t index) {
+    return type_data_get_type(page_table[index]);
+}
+
+uint8_t get_page_data(size_t index) {
+    return type_data_get_data(page_table[index]);
+}
+
+static inline uint8_t get_page_type_data(size_t index) {
+    return page_table[index];
+}
+
+static inline void set_page_type_data(size_t index, enum allocator_type type, uint8_t data) {
+    uint8_t type_data = type_data_pack(type, data);
+    page_table[index] = type_data;
+}
+
+size_t get_page_index(void *ptr) {
+    return ((size_t)ptr - (size_t)pages_start) / PAGE_SIZE;
+}
+
+size_t get_page_index_by_type_data(size_t start_index, enum allocator_type type, uint8_t data) {
+    uint8_t type_data = type_data_pack(type, data);
+
+    uint8_t t         = get_page_type_data(start_index);
+    if (t == type_data) {
+        return start_index;
+    }
+
+    start_index              += 1;
+    uint32_t start            = (start_index / BITMAP_WORD_BITS);
+    uint32_t start_bit_index  = (start_index % BITMAP_WORD_BITS);
+
+    for (uint32_t i = start; i < (page_bitmap_size / BITMAP_WORD_BYTES); ++i) {
+        bitmap_word word = atomic_load(&page_bitmap[i]);
+        if (word == BITMAP_WORD_MAX)
+            continue;
+
+        for (uint8_t bit_index = start_bit_index; bit_index < BITMAP_WORD_BITS; ++bit_index) {
+            if (page_bitmap_get_bit(word, bit_index))
+                continue;
+
+            size_t  index = (i * BITMAP_WORD_BITS) + bit_index;
+            uint8_t t     = get_page_type_data(index);
+            if (t == type_data) {
+                return index;
+            }
+        }
+
+        start_bit_index = 0;
+    }
+
+    return pages + 1;
+}
+
+void *get_page_by_index(size_t index) {
+    return pages_start + (index * PAGE_SIZE);
+}
+
+static void page_bitmap_initialize() {
+    for (size_t i = 0; i < page_bitmap_size / BITMAP_WORD_BYTES; i++) {
+        atomic_store(&page_bitmap[i], BITMAP_WORD_MAX); // All pages are initially free
+    }
+}
+
+static void page_table_initialize() {
+    for (size_t i = 0; i < pages; i++) {
+        page_table[i] = 0;
+    }
+}
+
+void print_size_skiplist() {
+    printf("Size skiplist, free_pages: %zi\n", free_pages);
+
+    for (int i = SKIPLIST_MAX_LEVEL - 1; i >= 0; i--) {
+        range_node_t *current = &free_ranges.head;
+        printf("Level %i: ", i);
+        size_t count = 0;
+        while (current) {
+            printf("%p<(%p)>%p(%zi-%zi:%zi) -> ", current->prev_size[i], current, current->next_size[i], current->start, current->start + current->size, current->size);
+            if (current == current->next_size[i]) {
+                printf("duplicate node %p\n", current);
+                exit(1);
+            }
+            if (current == (range_node_t *)current->next_size[i]) {
+                printf("DUP!\n");
+                exit(1);
+            }
+            current = (range_node_t *)current->next_size[i];
+            if (count >= free_pages + 10) {
+                printf("LOOP!\n");
+                exit(1);
+            }
+            ++count;
+        }
+        printf("\n");
+    }
+}
+
+static void print_index_skiplist() {
+    printf("Index skiplist\n");
+
+    for (int i = SKIPLIST_MAX_LEVEL - 1; i >= 0; i--) {
+        range_node_t *current = &free_ranges.head;
+        printf("Level %i: ", i);
+        while (current) {
+            printf("%p<(%p)>%p(%zi-%zi:%zi) -> ", current->prev[i], current, current->next[i], current->start, current->start + current->size, current->size);
+            if (current == current->next[i]) {
+                printf("duplicate node %p\n", current);
+                exit(1);
+            }
+            current = (range_node_t *)current->next[i];
+        }
+        printf("\n");
+    }
+}
+
+uintptr_t hash_pointer(void* ptr) {
+    uintptr_t value = (uintptr_t) ptr;
+    value >>= 12;                  // lower 12 bits are always 0
+    value = (value >> 16) ^ value; // Fold upper bits onto lower bits
+    value *= 0x45d9f3b;            // Multiply by a prime number
+    value ^= value >> 16;
+    return value;
+}
+
+static inline uint8_t determine_node_height(void *ptr) {
+    uintptr_t hash = hash_pointer(ptr);
+    int level = 1;
+
+    while ((hash & 1) == 0 && level < SKIPLIST_MAX_LEVEL) {
+        level++;
+        hash >>= 1;
+    }
+
+    return level;
+}
+
+static inline range_node_t* find_range_range_by_index(skiplist_t* list, range_node_t *node) {
+    range_node_t *current = &list->head;
+
+    for (int i = SKIPLIST_MAX_LEVEL - 1; i >= 0; i--) {
+        while ((range_node_t *)current->next[i] != NULL && (range_node_t *)current->next[i] < node) {
+            current = (range_node_t *)current->next[i];
+        }
+    }
+
+    return current;
+}
+
+static inline void remove_range_size(range_node_t *node) {
+   //printf("Size remove: %p before:\n", node);
+   //print_size_skiplist();
+   for (uint32_t i = 0; i < SKIPLIST_MAX_LEVEL; ++i) {
+       range_node_t* next_size = (range_node_t*)node->next_size[i];
+       range_node_t* prev_size = (range_node_t*)node->prev_size[i];
+
+       if (next_size) {
+           //printf("Remove updating next: %p\n", next_size);
+           atomic_store_explicit(&next_size->prev_size[i], (uintptr_t)prev_size, memory_order_release);
+       }
+
+       if (prev_size) {
+           //printf("Remove updating prev: %p\n", prev_size);
+           atomic_store_explicit(&prev_size->next_size[i], node->next_size[i], memory_order_release);
+       }
+   }
+   //printf("Size remove: %p after:\n", node);
+   //print_size_skiplist();
+}
+
+static inline void remove_range(range_node_t *node) {
+   //printf("Remove: %p before:\n", node);
+   //print_size_skiplist();
+   for (uint32_t i = 0; i < SKIPLIST_MAX_LEVEL; ++i) {
+       range_node_t* next = (range_node_t*)node->next[i];
+       range_node_t* prev = (range_node_t*)node->prev[i];
+       range_node_t* next_size = (range_node_t*)node->next_size[i];
+       range_node_t* prev_size = (range_node_t*)node->prev_size[i];
+
+       if (next) {
+           atomic_store_explicit(&next->prev[i], (uintptr_t)prev, memory_order_release);
+       }
+       if (next_size) {
+           //printf("Updating next: %p\n", next_size);
+           atomic_store_explicit(&next_size->prev_size[i], (uintptr_t)prev_size, memory_order_release);
+       }
+
+       if (prev) {
+           atomic_store_explicit(&prev->next[i], node->next[i], memory_order_release);
+       }
+       if (prev_size) {
+           //printf("Updating prev: %p\n", prev_size);
+           atomic_store_explicit(&prev_size->next_size[i], node->next_size[i], memory_order_release);
+       }
+   }
+   //printf("Remove: %p after:\n", node);
+   //print_size_skiplist();
+}
+
+static bool skip_list_remove(range_node_t *node) {
+    // We should be locked by the caller. If not: Good luck!
+
+    // Make sure we don't confuse anyone
+    uint32_t expected = RANGE_MAGIC;
+    uint32_t desired = 0;
+
+    if (!atomic_compare_exchange_strong(&node->magic, &expected, desired)) {
+        return false;
+    }
+
+    remove_range(node);
+    return true;
+}
+
+static inline int compare_range_size_index(range_node_t* a, range_node_t* b) {
+    if (a->size < b->size) return -1;
+    if (a->size > b->size) return 1;
+
+    if (a->start < b->start) return -1;
+    if (a->start > b->start) return 1;
+
+    printf("compare_range duplicate %p:%p\n", a, b);
+    //print_size_skiplist();
+    exit(1);
+    return 0;  // Both size and index are equal
+}
+
+static inline void insert_node_size(skiplist_t *list, range_node_t* node) {
+    range_node_t *update[SKIPLIST_MAX_LEVEL];
+    range_node_t *current = &list->head;
+
+    //printf("Size insert: %p at level %i\n", node, node->level);
+
+    // Find the place to re-insert the new node
+    for (int i = SKIPLIST_MAX_LEVEL - 1; i >= 0; i--) {
+        while ((range_node_t *)current->next_size[i] != NULL && compare_range_size_index(current->next_size[i], node) < 0) {
+            if (current == current->next_size[i]) {
+                printf("duplicate node %p\n", current);
+                exit(1);
+            }
+            current = (range_node_t *)current->next_size[i];
+        }
+        update[i] = current;
+    }
+
+    for (int i = 0; i < node->level + 1; i++) {
+        //printf("Updating: %p\n", update[i]);
+        range_node_t* next = (range_node_t*)update[i]->next_size[i];
+        if (next == node && next->size == 0) {
+            printf("trying to create a loop on level %i %p\n", i, node);
+            exit(1);
+        }
+        if (next) {
+            atomic_store_explicit(&next->prev_size[i], (uintptr_t)node, memory_order_release);
+        }
+        atomic_store_explicit(&update[i]->next_size[i], (uintptr_t)node, memory_order_release);
+        atomic_store_explicit(&node->prev_size[i], (uintptr_t)update[i], memory_order_release);
+        atomic_store_explicit(&node->next_size[i], (uintptr_t)next, memory_order_release);
+    }
+
+    //print_size_skiplist();
+}
+
+static inline void reinsert_node_size(skiplist_t *list, range_node_t* node, size_t new_size) {
+    //printf("Size re-insert: %p\n", node);
+    // Make sure we temporarily prevent this node frome being found
+    atomic_store(&node->size, 0);
+    remove_range_size(node);
+    atomic_store(&node->size, new_size);
+
+    insert_node_size(list, node);
+}
+
+static void insert_range_sorted(skiplist_t *list, range_node_t *node, size_t start_index, size_t size, bool coalesce) {
+    // We should be locked by the caller. If not: Good luck!
+
+    // place the structure in the middle of the page
+    node = (void*)((uintptr_t)node + PAGE_SIZE / 2);
+
+    if (atomic_load(&node->magic) == RANGE_MAGIC) {
+        printf("FATAL: Duplicate free?\n");
+        return;
+    }
+    
+    range_node_t *update[SKIPLIST_MAX_LEVEL];
+    range_node_t *current = &list->head;
+
+    // This is fine as the spin lock also issued an acquire fence
+    for (int i = SKIPLIST_MAX_LEVEL - 1; i >= 0; i--) {
+        while ((range_node_t *)current->next[i] != NULL && (range_node_t *)current->next[i] < node) {
+            current = (range_node_t *)current->next[i];
+        }
+        update[i] = current;
+    }
+
+    // We now have a pointer to the place right before where we want to insert at each level
+    
+    range_node_t *next_node = (range_node_t*)update[0]->next[0];
+    while (coalesce && next_node) {
+        if (start_index + size == next_node->start) {
+            // Our new range extends into the next node
+            size += next_node->size;
+            //printf("Extending into %p\n", next_node);
+            skip_list_remove(next_node);
+            next_node = (void*)next_node->next[0];
+        } else {
+            break;
+        }
+    }
+
+    // at this point the update array is filled with the nodes prior to this node
+    // on level 0 we have the immediate neighboring new nodes. If the prior node on
+    // level 0 ends where we begin then don't need to insert
+    if (coalesce && update[0] != &list->head && update[0]->start + update[0]->size == start_index) {
+        //printf("Expanding %p into our space %p start_index: %zi, prior end: %zi, prior size: %zi, new size: %zi\n", update[0], node, start_index, update[0]->start + update[0]->size, update[0]->size, update[0]->size + size);
+        // This range extends the prior range
+        reinsert_node_size(list, update[0], update[0]->size + size);
+        //atomic_fetch_add(&update[0]->size, size);
+        return;
+    }
+
+    //printf("Inserting range starting at %p start_index %zi size %zi coalesce: %i before:\n", node, start_index, size, coalesce);
+    //print_index_skiplist();
+
+    // We are under write lock, so no other writer can be touching this node
+    // we will be ussuing a thread fence again later
+    node->start = start_index;
+    node->size = size;
+    node->magic = RANGE_MAGIC;
+
+    // Make sure we don't have any weird pointers on other levels
+    for (uint32_t i = 0; i < SKIPLIST_MAX_LEVEL; ++i) {
+        node->next[i] = 0;
+        node->prev[i] = 0;
+        node->next_size[i] = 0;
+        node->prev_size[i] = 0;
+    }
+
+    int level = determine_node_height(node);
+    node->level = level - 1;
+    // Make sure that this node is fully ready
+    for (int i = 0; i < node->level + 1; i++) {
+        node->next[i] = update[i]->next[i];
+        node->prev[i] = (uintptr_t)update[i];
+    }
+
+    // All writes to the node should now be visible everywhere
+    atomic_thread_fence(memory_order_release);
+
+    //printf("Inserting %p at level %i\n", node, node->level);
+    // Now update everyone else's pointers
+    for (int i = 0; i < node->level + 1; i++) {
+        //printf("Updating: %p\n", update[i]);
+        range_node_t* next = (range_node_t*)update[i]->next[i];
+        if (next) {
+            atomic_store_explicit(&next->prev[i], (uintptr_t)node, memory_order_release);
+        }
+        atomic_store_explicit(&update[i]->next[i], (uintptr_t)node, memory_order_release);
+        //atomic_store_explicit(&node->prev[i], (uintptr_t)update[i], memory_order_release);
+        //atomic_store_explicit(&node->next[i], (uintptr_t)next, memory_order_release);
+    }
+    insert_node_size(list, node);
+    //print_index_skiplist();
+    //printf("Inserting range starting at %p start_index %zi size %zi coalesce: %i after:\n", node, start_index, size, coalesce);
+    //print_index_skiplist();
+}
+
+static range_node_t* skiplist_get_largest_node(skiplist_t* list) {
+    int level = SKIPLIST_MAX_LEVEL - 1;
+    range_node_t *current = &list->head;
+
+    // Traverse down and right, as far as possible
+    while (level >= 0) {
+        while (true) {
+            range_node_t *next_node = (range_node_t *)atomic_load(&current->next_size[level]);
+            if (next_node) {
+                current = next_node;
+            } else {
+                break; // We're at the rightmost node of this level
+            }
+        }
+        level--;
+    }
+
+    // Once we're at level 0 and at the rightmost node, check its size
+    size_t current_size = atomic_load(&current->size);
+    if (current_size == 0) {
+        // Get the previous node since this one has size 0
+        current = (range_node_t *)atomic_load(&current->prev_size[0]);
+    }
+    
+    if (current != &list->head) {
+        return current;
+    } else {
+        return NULL;
+    }
+}
+
+static size_t skiplist_get_largest_size(skiplist_t* list) {
+    range_node_t *node = skiplist_get_largest_node(list);
+
+    //print_size_skiplist();
+    //print_index_skiplist();
+    if (node)
+        return node->size;
+    return 0;
+}
+
+size_t get_largest_size() {
+    return skiplist_get_largest_size(&free_ranges);
+}
+
+static void* skiplist_get_pages(skiplist_t* list, size_t size) {
+    SPIN_LOCK_LOCK(list->write_lock);
+start:
+//    range_node_t *current = &list->head;
+    range_node_t *node = NULL;
+    void* page = NULL;
+
+    range_node_t *current = skiplist_get_largest_node(list);
+
+#if 0
+    for (int i = SKIPLIST_MAX_LEVEL - 1; i >= 0; i--) {
+        while ((node = (void*)atomic_load_explicit(&current->next_size[i], memory_order_relaxed))) {
+            size_t node_size = atomic_load_explicit(&node->size, memory_order_relaxed);
+            if (node_size && node_size < size) {
+                break;
+            }
+            current = node;
+        }
+    }
+#endif
+
+    if (!current || current == &list->head) {
+        // We didn't find anything
+        //return NULL;
+        goto out;
+    }
+
+//    if (!SPIN_LOCK_TRY_LOCK(list->write_lock)) {
+//        goto start;
+//    }
+
+    if (atomic_load_explicit(&current->magic, memory_order_relaxed) != RANGE_MAGIC) {
+        // Someone raced us here, retry
+        SPIN_LOCK_UNLOCK(list->write_lock);
+        goto start;
+    }
+
+    page = ALIGN_PAGE_DOWN(current);
+    size_t new_size = current->size - size;
+    void* new_node = (void*)((uintptr_t)page + (PAGE_SIZE * size));
+
+    // Careful balancing act, we don't want other allocators to fail
+    // We first set the old node's size to 0, then insert the new node node
+    // Then finally remove our node
+
+    atomic_store_explicit(&current->size, 0, memory_order_release);
+    if (new_size) {
+        insert_range_sorted(list, new_node, get_page_index(new_node), new_size, false);
+    }
+
+    if (!skip_list_remove((void*)current)) {
+        // Someone raced us here
+        printf("skip_list_remove failed, starting over\n");
+        exit(1);
+        SPIN_LOCK_UNLOCK(list->write_lock);
+        goto start;
+    }
+
+    // printf("Found range of size %zi at index %zi in a block of %zi %p\n", size, ((range_node_t *)current->next[0])->start, ((range_node_t *)current->next[0])-size, node);
+
+out:
+    SPIN_LOCK_UNLOCK(list->write_lock);
+    return page;
+}
+
+void page_alloc_init(void *start, void *end) {
+    mem_start              = (uint8_t *)start;
+    mem_end                = (uint8_t *)end;
+
+    uint8_t *first_page    = ALIGN_PAGE_UP(mem_start);
+    pages_end              = ALIGN_PAGE_DOWN((mem_end));
+    pages                  = (((size_t)pages_end) - ((size_t)first_page)) / PAGE_SIZE;
+
+    size_t page_table_size = pages;
+    page_bitmap_size       = ((((pages + 7) / 8) + BITMAP_WORD_BYTES - 1) / BITMAP_WORD_BYTES) * BITMAP_WORD_BYTES;
+
+    page_table             = mem_start;
+    page_bitmap            = (bitmap_word_atomic *)ALIGN_UP(mem_start + page_table_size, BITMAP_WORD_BYTES);
+    pages_start            = ALIGN_PAGE_UP(((char *)page_bitmap) + page_bitmap_size);
+
+    pages = (((size_t)pages_end) - ((size_t)pages_start)) / PAGE_SIZE; // Need to recaculate the number of pages now
+    free_pages = pages;
+
+    page_bitmap_initialize();
+    page_table_initialize();
+    insert_range_sorted(&free_ranges, (range_node_t*)pages_start, 0, pages, false);
+
+#ifndef BADGEROS_KERNEL
+    size_t waste = (((size_t)pages_start - (size_t)mem_start)) - (page_table_size + page_bitmap_size);
+
+    printf(
+        "Memory starts at: %p, Memory ends at: %p, First page at: %p, "
+        "total_pages: %zi, page_table_size: %zi, page_bitmap_size: %zi, waste: %zi, usable memory: %zi\n",
+        start,
+        end,
+        pages_start,
+        pages,
+        page_table_size,
+        page_bitmap_size,
+        waste,
+        pages * PAGE_SIZE
+    );
+    printf("Page bitmap at %p\n", page_bitmap);
+#endif
+}
+
+void *page_alloc_link(size_t size) {
+    if (!size)
+        return NULL;
+
+    return NULL;
+}
+
+void page_free_link(void *ptr) {
+    if (!ptr)
+        return;
+}
+
+void *page_alloc(enum allocator_type type, uint8_t data) {
+    void* page = skiplist_get_pages(&free_ranges, 1);
+    if (page) {
+        atomic_fetch_sub(&free_pages, 1);
+        size_t page_index = get_page_index(page);
+        set_page_type_data(page_index, type, data);
+    }
+
+    return page;
+}
+
+void page_free(void *ptr) {
+    if (!ptr) {
+        return;
+    }
+
+    //printf("Free: %p\n", ptr);
+    atomic_fetch_add(&free_pages, 1);
+    SPIN_LOCK_LOCK(free_ranges.write_lock);
+    insert_range_sorted(&free_ranges, ptr, get_page_index(ptr), 1, true);
+    SPIN_LOCK_UNLOCK(free_ranges.write_lock);
+    //printf("End Free: %p\n", ptr);
+}
+
+#if 0
+void *page_alloc(enum allocator_type type, uint8_t data) {
+start_alloc:
+    if (!atomic_load(&free_pages))
+        return NULL;
+
+    for (uint32_t i = 0; i < page_bitmap_size / BITMAP_WORD_BYTES; ++i) {
+        bitmap_word word = atomic_load(&page_bitmap[i]);
+        if (word == 0)
+            continue;
+
+        uint32_t    bit_index = bitmap_find_first_trailing_set_bit(word);
+        bitmap_word desired   = page_bitmap_clear_bit(word, bit_index);
+
+        if (!atomic_compare_exchange_strong(&page_bitmap[i], &word, desired)) {
+            // Allocation failed due to race condition. We will just start from the top
+            // This can be made a bit more efficient by for instance only starting from
+            // the current word, but we want to achieve tight packing of pages near
+            // the start.
+            goto start_alloc;
+        }
+
+        atomic_fetch_sub(&free_pages, 1);
+        size_t page_index = i * BITMAP_WORD_BITS + bit_index;
+        set_page_type_data(page_index, type, data);
+        void *page = get_page_by_index(page_index);
+        // printf("Allocated page: (%p)\n", page);
+        return page;
+    }
+    return NULL;
+}
+#endif
+
+#if 0
+void page_free(void *ptr) {
+    if (!ptr) {
+#ifndef BADGEROS_KERNEL
+        printf("Attempting to free NULL\n");
+#endif
+        return;
+    }
+
+    size_t      page_index = get_page_index(ptr);
+    uint32_t    word_index = page_index / BITMAP_WORD_BITS;
+    uint8_t     bit_index  = page_index % BITMAP_WORD_BITS;
+
+    bitmap_word expected, desired;
+    do {
+        expected = atomic_load(&page_bitmap[word_index]);
+        desired  = page_bitmap_set_bit(expected, bit_index);
+
+        if (desired == expected) {
+#ifndef BADGEROS_KERNEL
+            printf("Duplicate page_free() ptr: %p, %zi (%i, %i)\n", ptr, page_index, word_index, bit_index);
+#endif
+            return;
+        }
+    } while (!atomic_compare_exchange_weak_explicit(
+        &page_bitmap[word_index],
+        &expected,
+        desired,
+        memory_order_acq_rel,
+        memory_order_relaxed
+    ));
+    atomic_fetch_add(&free_pages, 1);
+    // printf("Free page: (%p)\n", ptr);
+    // printf("page_free: %zi\n", atomic_fetch_add(&free_pages, 1));
+}
+#endif

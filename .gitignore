@@ -1,0 +1,6 @@
+*.o
+*.swp
+*.so
+*/perf*
+*/malloc32*
+*/malloc64*

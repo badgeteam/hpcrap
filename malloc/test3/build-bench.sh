@@ -1,0 +1,4 @@
+gcc -std=gnu17 -DBITMAP_WORD_BITS=64 -DBADGEROS_KERNEL -O3 -g3 -Wall -Wextra -lunwind -lunwind-x86_64 bench.c malloc.c alloc-*.c -Wl,--wrap,malloc -Wl,--wrap,free -Wl,--wrap,calloc -Wl,--wrap,realloc -Wl,--wrap,reallocarray -o bench-badge
+gcc -std=gnu17 -DSYSTEM_MALLOC -DBITMAP_WORD_BITS=64 -O3 -g3 -Wall -Wextra -lunwind -lunwind-x86_64 bench.c malloc.c alloc-*.c -Wl,--wrap,malloc -Wl,--wrap,free -Wl,--wrap,calloc -Wl,--wrap,realloc -Wl,--wrap,reallocarray -o bench-system
+gcc -std=gnu17 -DBITMAP_WORD_BITS=64 -DBADGEROS_KERNEL -DSOFTBIT -O3 -g3 -Wall -Wextra -lunwind -lunwind-x86_64 bench.c malloc.c alloc-*.c -Wl,--wrap,malloc -Wl,--wrap,free -Wl,--wrap,calloc -Wl,--wrap,realloc -Wl,--wrap,reallocarray -o bench-badge-softbit
+gcc -std=gnu17 -DBITMAP_WORD_BITS=64 -DBADGEROS_KERNEL -g3 -Wall -Wextra -lunwind -lunwind-x86_64 bench.c malloc.c alloc-*.c -Wl,--wrap,malloc -Wl,--wrap,free -Wl,--wrap,calloc -Wl,--wrap,realloc -Wl,--wrap,reallocarray -o bench-badge-debug

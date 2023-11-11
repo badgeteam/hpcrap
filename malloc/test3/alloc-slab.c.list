@@ -1,0 +1,468 @@
+#ifndef BADGEROS_KERNEL
+#include <stdio.h>
+#include <stdlib.h>
+#endif
+
+#include "allocator.h"
+
+#include <stdatomic.h>
+#include <stdint.h>
+
+#define BITMAP_WORDS        4
+#define DATA_OFFSET         64
+#define PAGE_ALLOC_BITS(x)  (((PAGE_SIZE - 32) - ((x)-1)) / (x))
+#define PAGE_ALLOC_BYTES(x) ((PAGE_ALLOC_BITS(x) + 7) / 8)
+
+#define SPIN_WAIT_COUNT 25
+
+#define LOCK_VALUE (void *)0xFFFF // not page aligned can not happen
+
+static uint16_t slab_bytes[]    = {32, 64, 128, 256};
+static uint16_t slab_entries[]  = {126, 63, 31, 15};
+
+// This needs to be correct otherwise finding an empty slab slot will not work
+static uint32_t slab_empty[][4] = {
+    {UINT32_MAX, UINT32_MAX, UINT32_MAX, 0x3FFFFFFF},
+    {UINT32_MAX, 0x7FFFFFFF, 0, 0},
+    {0x7FFFFFFF, 0, 0, 0},
+    {0x00007FFF, 0, 0, 0}};
+
+typedef struct slab_header {
+    enum slab_sizes       size;
+    atomic_uintptr_t      next_slab;
+    atomic_uint_least32_t bitmap[4];
+    atomic_uint_least32_t use_count;
+    atomic_uint_least32_t status;
+} slab_header_t;
+
+enum slab_status {
+    SLAB_STATUS_IN_LIST = 0,
+    SLAB_STATUS_OUT_LIST = 1,
+    SLAB_STATUS_DEALLOCATED = 2,
+};
+
+static atomic_uintptr_t slab_head_active[]  = {0, 0, 0, 0};
+static atomic_uintptr_t slab_head_inactive[]  = {0, 0, 0, 0};
+static atomic_uint_least32_t inactive_count = 0;
+
+// static atomic_uintptr_t         slab_cache[] = {0, 0, 0, 0};
+static atomic_flag slab_alloc_lock[] = {ATOMIC_FLAG_INIT, ATOMIC_FLAG_INIT, ATOMIC_FLAG_INIT, ATOMIC_FLAG_INIT};
+static atomic_flag slab_dealloc_lock[] = {ATOMIC_FLAG_INIT, ATOMIC_FLAG_INIT, ATOMIC_FLAG_INIT, ATOMIC_FLAG_INIT};
+
+#ifndef BADGEROS_KERNEL
+#include <assert.h>
+
+static_assert((sizeof(slab_header_t) <= DATA_OFFSET), "Slab header must be smaller than DATA_OFFSET");
+#endif
+
+/* comment so clang-format is happy */
+
+static inline bool bitmap_get_bit(const uint32_t word, uint8_t bit_index) {
+    return (word & ((uint32_t)1 << bit_index)) != 0;
+}
+
+static inline uint32_t bitmap_set_bit(const uint32_t word, uint8_t bit_index) {
+    return word | ((uint32_t)1 << bit_index);
+}
+
+static inline uint32_t bitmap_clear_bit(const uint32_t word, uint8_t bit_index) {
+    return word & ~((uint32_t)1 << bit_index);
+}
+
+static void init_slab(const slab_header_t *header, const enum slab_sizes size) {
+    for (uint32_t i = 0; i < BITMAP_WORDS; ++i) {
+        atomic_store_explicit(&header->bitmap[i], slab_empty[size][i], memory_order_release);
+    }
+    
+    atomic_store_explicit(&header->size, size, memory_order_release);
+    atomic_store_explicit(&header->next_slab, 0xBBBBBBBB, memory_order_release);
+    atomic_store_explicit(&header->use_count, 1, memory_order_release);
+    atomic_store_explicit(&header->status, SLAB_STATUS_OUT_LIST, memory_order_release);
+}
+
+static void panic(const slab_header_t* page, const char* message) {
+    enum slab_sizes size = page->size;
+
+    printf("PANIC: %s %p\n", message, page);
+    printf("Current root: %p\n", (slab_header_t *)atomic_load(&slab_head_active[size]));
+    uint32_t indent = 0;
+    slab_header_t *c = (slab_header_t *)atomic_load(&slab_head_active[size]);
+    while (c) {
+        for(uint32_t i = 0; i < indent; ++i) { printf(" "); }
+
+        if (c == (void*)c->next_slab) {
+            printf("%p -> %p <--- DEAD\n", c, (void*)c->next_slab);
+            exit(1);
+        } else {
+            printf("%p -> %p\n", c, (void*)c->next_slab);
+        }
+        ++indent;
+        c = (void*)atomic_load(&c->next_slab);
+    }
+    exit(1);
+}
+
+static void insert_slab_sorted(void *head, const slab_header_t *header) {
+    uint32_t expected = SLAB_STATUS_OUT_LIST;
+    uint32_t desired = SLAB_STATUS_IN_LIST;
+
+    if (!atomic_compare_exchange_strong_explicit(&header->status, &expected, desired, memory_order_acq_rel, memory_order_acquire)) {
+        return;
+    }
+
+    slab_header_t *current = (void*)atomic_load((uintptr_t*)head);
+    slab_header_t *prev = NULL;
+
+    // Traverse the list to find the right position for header
+    while (current && current < header) {
+        if (current == (void*)current->next_slab) {
+            panic(current, "Detected loop (current == next)");
+        }
+        prev = current;
+        current = (slab_header_t *) atomic_load(&current->next_slab);
+    }
+
+    if (current == header) {
+        panic (header, "Attempting to insert duplicate page (current == page)");
+    }
+
+    if (!prev) { // Insert as new slab root
+        atomic_store(&header->next_slab, (uintptr_t) current);
+        atomic_store_explicit((uintptr_t*)head, (uintptr_t)header, memory_order_release);
+    } else { // Insertion is somewhere in the middle
+        atomic_store(&header->next_slab, (uintptr_t) current);
+        atomic_store(&prev->next_slab, (uintptr_t) header);
+    }
+
+    if ((void*)atomic_load(&header->next_slab) == header) {
+        panic(header, "Attempting a duplicate insertion (next == header)");
+    }
+}
+
+static inline void* find_slab_prev(slab_header_t *head, const void *page) {
+    slab_header_t *current = head;
+    slab_header_t *prev = NULL;
+
+    while(current && current->next_slab) {
+        prev = current;
+        current = (void*)atomic_load(&current->next_slab);
+        if (current == page) return prev;
+    }
+
+    return NULL;
+}
+
+static void remove_slab(void *head, const void *page, bool deleting) {
+    const slab_header_t *header = page;
+
+    uint32_t expected = SLAB_STATUS_IN_LIST;
+    uint32_t desired = SLAB_STATUS_OUT_LIST;
+
+    if (!deleting) {
+        // If we aren't deleting the page we can just have someone else try later without spinning
+        if (!atomic_compare_exchange_strong_explicit(&header->status, &expected, desired, memory_order_acq_rel, memory_order_acquire)) {
+            return;
+        }
+    } else {
+        // If we are actually deleting the page we should just spin here until the page is actually removed
+        do {
+            if (!atomic_compare_exchange_strong_explicit(&header->status, &expected, desired, memory_order_acq_rel, memory_order_acquire)) {
+                if (expected == desired) {
+                    return;
+                }
+                printf("ERROR: Slab state: %i\n", expected);
+            } else {
+                break;
+            }
+        } while(true);
+    }
+    
+    slab_header_t *next_header = (slab_header_t *)atomic_load(&header->next_slab);
+    slab_header_t *current_head = (void*)atomic_load((uintptr_t*)head);
+    if (page == current_head) {
+        atomic_store_explicit((uintptr_t*)head, (uintptr_t)next_header, memory_order_release);
+        return;
+    } 
+
+    slab_header_t *prev_header = find_slab_prev(*(slab_header_t**)head, page);
+    if (prev_header) {
+        atomic_store_explicit(&prev_header->next_slab, header->next_slab, memory_order_release);
+        //atomic_store_explicit(&header->prev_slab, 0, memory_order_release);
+    }
+
+    if ((void*)atomic_load(&header->next_slab) == header) {
+        panic(header, "Created loop on removal (current == next)");
+    }
+}
+
+static void *allocate_slab(const enum slab_sizes size) {
+    if (atomic_flag_test_and_set_explicit(&slab_alloc_lock[size], memory_order_acquire)) {
+        return LOCK_VALUE;
+    }
+
+    slab_header_t *page = page_alloc(ALLOCATOR_SLAB, size);
+
+    if (!page) {
+        atomic_flag_clear_explicit(&slab_alloc_lock[size], memory_order_release);
+        // printf("Slab: allocating page for size %i failed\n", size);
+        return NULL;
+    }
+
+    init_slab(page, size);
+    insert_slab_sorted(&slab_head_active[size], page);
+
+#ifndef BADGEROS_KERNEL
+    //printf("allocate_slab(%i) page = %p\n", size, page);
+#endif
+
+    // atomic_store_explicit(&slab_cache[size], (uintptr_t)page, memory_order_release);
+    atomic_flag_clear_explicit(&slab_alloc_lock[size], memory_order_release);
+    return page;
+}
+
+static void deallocate_slab(void *page) {
+    slab_header_t  *header = (slab_header_t *)page;
+    enum slab_sizes size   = header->size;
+
+#ifndef BADGEROS_KERNEL
+    // printf("deallocate_slab(%p)\n", page);
+    // if (tries > 1) printf("Deallocate_slab(%p) after %i tries\n", page, tries);
+#endif
+
+    SPIN_LOCK_LOCK(slab_alloc_lock[size]);
+    remove_slab(&slab_head_active[size], page, true);
+    atomic_store_explicit(&header->status, SLAB_STATUS_DEALLOCATED, memory_order_release);
+    page_free(page);
+    SPIN_LOCK_UNLOCK(slab_alloc_lock[size]);
+
+    //SPIN_LOCK_LOCK(slab_dealloc_lock[size]);
+    //insert_slab_sorted(&slab_head_inactive[size], page);
+    //uint32_t inactive = atomic_fetch_add(&inactive_count, 1);
+    //SPIN_LOCK_UNLOCK(slab_dealloc_lock[size]);
+}
+
+static inline bool try_get_slab_page(void const *page, const enum slab_sizes size) {
+    slab_header_t *header = (slab_header_t *)page;
+
+    // Immediately take ownership of the page, we might be racing a free
+    // or we might have gotten this page at the same time as another thread
+    uint32_t use_count    = atomic_fetch_add(&header->use_count, 1);
+
+    // We might have raced here, and the page table is not atomic
+    if (header->size != size || use_count >= slab_entries[size]) {
+#ifndef BADGEROS_KERNEL
+        // printf("get_slab_page(%i) page %p is full\n", size, page);
+#endif
+        if (use_count < 0x0FFF) {
+            // Only touch the page again if it is not being deallocated
+            atomic_fetch_sub(&header->use_count, 1);
+
+            // Slab is full lets stop looking at it, but don't try very hard
+            if (!atomic_flag_test_and_set_explicit(&slab_alloc_lock[size], memory_order_acquire)) {
+                remove_slab(&slab_head_active[header->size], page, false);
+                atomic_flag_clear_explicit(&slab_alloc_lock[size], memory_order_release);
+            }
+        }
+        return false;
+    }
+
+    return true;
+}
+
+static void *get_slab_page(const enum slab_sizes size, uint32_t tries) {
+    slab_header_t *page = NULL;
+    slab_header_t *start_page = NULL;
+
+start:
+    page = (void *)atomic_load(&slab_head_active[size]);
+
+    if (!page || tries > 10) {
+        page = allocate_slab(size);
+        if (page == LOCK_VALUE) {
+            tries = 0;
+            goto start;
+        }
+        return page;
+    }
+
+    start_page = page; // Remember the starting page
+
+    do {
+        if (!try_get_slab_page(page, size)) {
+            page = (slab_header_t*)atomic_load(&page->next_slab);
+            if (!page) {
+                page = (void *)atomic_load(&slab_head_active[size]); // Wrap around to the beginning
+                // If there is no root page we need to allocate a new one
+                if (!page) goto start;
+            }
+        } else {
+            return page;
+        }
+    } while (page != start_page); // Ensure we don't endlessly loop
+
+    // If we reached here, it means we couldn't find a slab after a full traversal.
+    page = allocate_slab(size);
+    if (page == LOCK_VALUE) {
+        goto start;
+    }
+
+    return page;
+}
+
+void *slab_alloc(size_t size) {
+    if (size > 256)
+        return NULL;
+
+    uint8_t slab_type = SLAB_SIZE_32;
+    if (size > 128)
+        slab_type = SLAB_SIZE_256;
+    else if (size > 64)
+        slab_type = SLAB_SIZE_128;
+    else if (size > 32)
+        slab_type = SLAB_SIZE_64;
+
+    slab_header_t *page  = NULL;
+
+    uint32_t       tries = 0;
+start_alloc:
+    page = get_slab_page(slab_type, tries);
+    // printf("Got page: %p\n", page);
+    if (!page) {
+        // printf("slab_alloc: Could not find a page for size %i\n", slab_type);
+        return NULL;
+    }
+
+    for (uint32_t i = 0; i < BITMAP_WORDS; ++i) {
+        uint32_t word = atomic_load(&page->bitmap[i]);
+
+        if (word == 0)
+            continue;
+
+        uint32_t bit_index = ffs32((int32_t)word) - 1;
+        uint32_t desired   = bitmap_clear_bit(word, bit_index);
+
+        if (!atomic_compare_exchange_strong(&page->bitmap[i], &word, desired)) {
+            // printf("-");
+            goto out;
+        }
+
+        size_t index  = (i * 32) + bit_index;
+        void  *retval = ((uint8_t *)page) + DATA_OFFSET + (index * slab_bytes[slab_type]);
+#ifndef BADGEROS_KERNEL
+        // printf(
+        //     "Allocating %p word_index %i bit_index %i use_count: %i size: %i pointer: (%p)\n",
+        //     page,
+        //     i,
+        //     bit_index,
+        //     atomic_load(&page->use_count),
+        //     slab_bytes[slab_type],
+        //     retval
+        //);
+#endif
+        // printf("*");
+        // if(tries > 10) printf("Allocation of %p succeeded after %i tries\n", retval, tries);
+        return retval;
+    }
+
+out:
+    atomic_fetch_sub(&page->use_count, 1);
+    // printf(".");
+    ++tries;
+    goto start_alloc;
+}
+
+void slab_free(void *ptr) {
+    if (!ptr) {
+#ifndef BADGEROS_KERNEL
+        printf("slab_free: Attempting to free NULL\n");
+#endif
+        return;
+    }
+
+    slab_header_t *page       = ALIGN_PAGE_DOWN(ptr);
+
+    size_t         page_index = get_page_index(page);
+    uint8_t        page_type  = get_page_type(page_index);
+
+    if (page_type != ALLOCATOR_SLAB) {
+#ifndef BADGEROS_KERNEL
+        printf("slab_free: Attempting to free an allocation of wrong type\n");
+#endif
+        return;
+    }
+
+    slab_header_t *header     = (slab_header_t *)page;
+    enum slab_sizes size      = header->size;
+    size_t         offset     = (size_t)(ptr) - (size_t)(page);
+    offset                   -= DATA_OFFSET;
+    uint32_t total_bit_index  = offset / slab_bytes[header->size];
+    uint32_t word_index       = total_bit_index / 32;
+    uint32_t bit_index        = total_bit_index % 32;
+
+    uint32_t expected, desired;
+    do {
+        expected = atomic_load(&header->bitmap[word_index]);
+        desired  = bitmap_set_bit(expected, bit_index);
+        if (expected == desired) {
+#ifndef BADGEROS_KERNEL
+            // printf(
+            //     "Duplicate free %p word_index %i bit_index %i size: %i pointer: %p\n",
+            //     page,
+            //     word_index,
+            //     bit_index,
+            //     slab_bytes[header->size],
+            //     ptr
+            //);
+#endif
+            return;
+        } else {
+        }
+    } while (!atomic_compare_exchange_weak_explicit(
+        &header->bitmap[word_index],
+        &expected,
+        desired,
+        memory_order_acq_rel,
+        memory_order_acquire
+    ));
+
+    atomic_fetch_sub(&header->use_count, 1);
+    //uint32_t use_count = atomic_fetch_sub(&header->use_count, 1);
+#ifndef BADGEROS_KERNEL
+    // printf(
+    //     "Free %p word_index %i bit_index %i use_count: %i size: %i pointer: (%p)\n",
+    //     page,
+    //     word_index,
+    //     bit_index,
+    //     use_count,
+    //     slab_bytes[header->size],
+    //     ptr
+    //);
+#endif
+    expected = 0;
+    desired  = 0xC0FFEE;
+
+    if (atomic_compare_exchange_strong_explicit(
+            &header->use_count,
+            &expected,
+            desired,
+            memory_order_acq_rel,
+            memory_order_acquire
+        )) {
+        // if (i)
+        //     printf("Deallocating slab %p after %i tries\n", header, i);
+        deallocate_slab(page);
+        return;
+    }
+
+    if (atomic_load(&header->status) == SLAB_STATUS_OUT_LIST) {
+        // Slab has space again, add it back into the list, but don't try too hard
+        // use expected here from the failed CAS loop as the current use count
+        //do {
+            if (!atomic_flag_test_and_set_explicit(&slab_alloc_lock[size], memory_order_acquire)) {
+                insert_slab_sorted(&slab_head_active[size], page);
+                atomic_flag_clear_explicit(&slab_alloc_lock[size], memory_order_release);
+                return;
+            }
+        //} while (expected <= slab_sizes[size] / 2);
+    }
+}

@@ -1,0 +1,148 @@
+#include <stdio.h>
+#include <assert.h>
+#include <stdatomic.h>
+
+#include "allocator.h"
+
+#define PAGE_SIZE 4096
+#define ALIGN_PAGE_UP(x) (uint8_t*)(((size_t)(x) + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1))
+#define ALIGN_PAGE_DOWN(x) (uint8_t*)((size_t)(x) & ~(PAGE_SIZE - 1))
+
+enum allocator_type {
+        ALLOCATOR_PAGE_EMPTY = 0,
+        ALLOCATOR_PAGE = 1,
+        ALLOCATOR_SLAB = 2,
+        ALLOCATOR_BUDDY = 3
+};
+
+static_assert((ALLOCATOR_BUDDY < 16), "Allocator type values must fit into 4 bits");
+
+size_t pages;
+_Atomic uint8_t* page_table;
+uint8_t* mem_start;
+uint8_t* mem_end;
+uint8_t* pages_start;
+uint8_t* pages_end;
+_Atomic size_t first_free_page;
+_Atomic size_t free_pages;
+
+size_t get_free_pages() {
+        return atomic_load(&free_pages);
+}
+
+size_t get_pages() {
+        return pages;
+}
+
+uint8_t get_page_type(size_t index) {
+        return (atomic_load(&page_table[index >> 1]) >> ((index & 1) << 2)) & 0x0F;
+}
+
+void set_page_type(size_t index, enum allocator_type type) {
+        uint8_t mask = 0x0F << ((index & 1) << 2);
+        uint8_t old_val, new_val;
+        do {
+            old_val = atomic_load(&page_table[index >> 1]);
+            new_val = (old_val & ~mask) | ((type & 0x0F) << ((index & 1) << 2));
+        } while (!atomic_compare_exchange_weak(&page_table[index >> 1], &old_val, new_val));
+}
+
+uint8_t get_and_set_page_type(size_t index, enum allocator_type type) {
+    uint8_t mask = 0x0F << ((index & 1) << 2);
+    uint8_t old_val, new_val;
+    do {
+        old_val = atomic_load(&page_table[index >> 1]);
+        new_val = (old_val & ~mask) | ((type & 0x0F) << ((index & 1) << 2));
+    } while (!atomic_compare_exchange_weak(&page_table[index >> 1], &old_val, new_val));
+
+    return (old_val >> ((index & 1) << 2)) & 0x0F;
+}
+
+size_t get_page_index(void* ptr) {
+        return ((size_t)ptr - (size_t)pages_start) / PAGE_SIZE;
+}
+
+uint8_t* get_page_by_index(size_t index) {
+        return pages_start + (index * PAGE_SIZE);
+}
+
+void page_alloc_init(void* start, void *end) {
+        mem_start = (uint8_t*)start;
+        mem_end = (uint8_t*)end;
+
+        uint8_t* first_page = ALIGN_PAGE_UP(mem_start);
+        pages_end = ALIGN_PAGE_DOWN((mem_end));
+        pages = (((size_t)pages_end) - ((size_t)first_page)) / PAGE_SIZE;
+
+        size_t waste = (size_t)first_page - (size_t)mem_start;
+        size_t page_table_size = (pages + 1) / 2; // 4 bits per page
+
+        if (waste > page_table_size) {
+                page_table = (_Atomic uint8_t*)mem_start;
+                pages_start = first_page;
+                waste = waste - page_table_size;
+        } else {
+                page_table = (_Atomic uint8_t*)first_page;
+                pages_start = ALIGN_PAGE_UP(first_page + page_table_size);
+        }
+
+        first_free_page = get_page_index(pages_start);
+        pages = (((size_t)pages_end) - ((size_t)pages_start)) / PAGE_SIZE; // Need to recaculate the number of pages now
+        free_pages = pages;
+
+        for (size_t i = 0; i < page_table_size; ++i) {
+                page_table[i] = 0;
+        }
+
+        printf("Memory starts at: %p, Memory ends at: %p, First page at: %p, total_pages: %zi, page_table_size: %zi, waste: %zi\n", start, end, pages_start, pages, page_table_size, waste);
+}
+
+void* page_alloc() {
+    size_t current_free_page, next_free_page;
+
+    do {
+        current_free_page = atomic_load(&first_free_page);
+        if (current_free_page >= pages || atomic_load(&free_pages) == 0) return NULL;
+
+        if (get_and_set_page_type(current_free_page, ALLOCATOR_PAGE) != ALLOCATOR_PAGE_EMPTY) {
+            next_free_page = current_free_page + 1;
+            while (next_free_page < pages && get_page_type(next_free_page) != ALLOCATOR_PAGE_EMPTY) {
+                next_free_page++;
+            }
+            atomic_compare_exchange_weak(&first_free_page, &current_free_page, next_free_page);
+            continue;
+        }
+
+        next_free_page = current_free_page + 1;
+        while (next_free_page < pages && get_page_type(next_free_page) != ALLOCATOR_PAGE_EMPTY) {
+            next_free_page++;
+        }
+
+        if (atomic_compare_exchange_weak(&first_free_page, &current_free_page, next_free_page)) {
+            atomic_fetch_sub(&free_pages, 1);
+            return get_page_by_index(current_free_page);
+        }
+    } while (1);
+
+    return NULL;
+}
+
+void page_free(void* ptr) {
+    if (! ptr) {
+        printf("Attempting to free NULL\n");
+        return;
+    }
+
+    size_t page_index = get_page_index(ptr);
+    if (! get_page_type(page_index)) printf("Duplicate free()! %zi\n", page_index);
+
+    set_page_type(page_index, ALLOCATOR_PAGE_EMPTY);
+
+    size_t current_first_free;
+    do {
+        current_first_free = atomic_load(&first_free_page);
+    } while (page_index < current_first_free && !atomic_compare_exchange_weak(&first_free_page, &current_first_free, page_index));
+
+    atomic_fetch_add(&free_pages, 1);
+}
+

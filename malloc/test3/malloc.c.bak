@@ -1,0 +1,135 @@
+#include <stddef.h>
+
+#ifndef __KERNEL__
+#include <stdlib.h>
+#include <stdio.h>
+
+void *__real_malloc(size_t size);
+void __real_free(void *ptr);
+void *__real_calloc(size_t nmemb, size_t size);
+void *__real_realloc(void *ptr, size_t size);
+void *__real_reallocarray(void *ptr, size_t nmemb, size_t size);
+
+#else
+#define __wrap_malloc malloc
+#define __wrap_free free
+#define __wrap_calloc calloc
+#define __wrap_realloc realloc
+#define __wrap_reallocarray reallocarray
+
+#endif
+
+#define NUM_SIZE_CLASSES 5
+#define MIN_BLK_SIZE ALIGN(sizeof(free_blk_header_t))
+
+#define ALIGNMENT 8
+#define ALIGN(size) (((size) + (ALIGNMENT-1)) & ~(ALIGNMENT-1))
+
+typedef struct free_blk_header {
+	size_t size;
+	struct free_blk_header *next;
+	struct free_blk_header *prior;
+} free_blk_header_t;
+
+char *mem_start;
+char *mem_end;
+free_blk_header_t *free_lists;
+
+void init_heap();
+void try_split(free_blk_header_t * fp, size_t needed);
+void *find_fit(size_t size);
+
+size_t min_class_size[] = { MIN_BLK_SIZE, 64, 128, 256, 1024 };
+
+void print_heap() {
+	for (int i = 0; i < NUM_SIZE_CLASSES; i++) {
+		printf("Bucket size: %zi\n", min_class_size[i]);
+		free_blk_header_t* fp = &free_lists[i];
+
+		while (fp->next != &free_lists[i]) {
+			printf("\tFree block of size: %zi\n", fp->next->size);
+			fp = fp->next;
+		}
+	}
+}
+
+void init_heap() {
+	free_lists = __real_malloc(1024 * 1024 * 4);
+	mem_start = ((char*)free_lists) + (NUM_SIZE_CLASSES * sizeof(free_blk_header_t));
+	mem_end = mem_start;
+
+	for (int i = 0; i < NUM_SIZE_CLASSES; i++) {
+		free_lists[i].size = 0;
+		free_lists[i].next = free_lists[i].prior = &free_lists[i];
+	}
+}
+
+void *find_fit(size_t size) {
+	free_blk_header_t *fp;
+
+	for (int i = 0; i < NUM_SIZE_CLASSES; i++) {
+		if (min_class_size[i] >= size && free_lists[i].next != &free_lists[i]) {
+			fp = free_lists[i].next;
+			free_lists[i].next = fp->next;
+			fp->next->prior = &free_lists[i];
+			try_split(fp, size);
+			return fp;
+		}
+	}
+
+	return NULL;
+}
+
+void try_split(free_blk_header_t *fp, size_t needed) {
+	size_t remaining = fp->size - needed;
+	free_blk_header_t *sp;
+
+	if (remaining < MIN_BLK_SIZE)
+		return;
+
+	fp->size = needed;
+	sp = (free_blk_header_t *) ((char *)fp + needed);
+	sp->size = remaining;
+
+	for (int i = NUM_SIZE_CLASSES - 1; i > 0; i--) {
+		if (min_class_size[i] <= remaining) {
+			sp->prior = &free_lists[i];
+			sp->next = free_lists[i].next;
+			free_lists[i].next = free_lists[i].next->prior = sp;
+			printf("Split!\n");
+			break;
+		}
+	}
+}
+
+void *__wrap_malloc(size_t size) {
+	size_t *header;
+	size_t blk_size = ALIGN(size + sizeof(free_blk_header_t));
+
+	blk_size = (blk_size < MIN_BLK_SIZE) ? MIN_BLK_SIZE : blk_size;
+	header = find_fit(blk_size);
+
+	if (header) {
+		*header = ((free_blk_header_t *) header)->size | 1;
+	} else {
+		header = (size_t*)mem_end;
+		mem_end += blk_size;
+		*header = blk_size | 1;
+	}
+	return (char *)header + sizeof(free_blk_header_t);
+}
+
+void __wrap_free(void *ptr) {
+	free_blk_header_t *header = (free_blk_header_t*)((char *)ptr - sizeof(free_blk_header_t));
+	size_t size = header->size;
+	header->size = *(size_t *)header & ~1L;
+
+	for (int i = 0; i < NUM_SIZE_CLASSES; i++) {
+		if (min_class_size[i] >= size) {
+			header->next = free_lists[i].next;
+			header->prior = &free_lists[i];
+			free_lists[i].next = free_lists[i].next->prior = header;
+			return;
+		}
+	}
+}

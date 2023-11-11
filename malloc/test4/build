@@ -1,0 +1,21 @@
+#!/bin/bash
+set -e
+
+sources="main.c real-malloc.c alloc-page.c"
+libs="-lunwind -lunwind-x86_64"
+wraps="-Wl,--wrap,malloc -Wl,--wrap,free -Wl,--wrap,calloc -Wl,--wrap,realloc -Wl,--wrap,reallocarray"
+defines="-DBADGEROS_MALLOC_STANDALONE -DBADGEROS_MALLOC_DEBUG_LEVEL=5"
+
+rm -f malloc32 malloc64 malloc32-softbit malloc64-softbit
+
+gcc -Wall -Wextra -std=gnu17 -DBITMAP_WORD_BITS=32 -g3 -Wall -Wextra ${sources} ${libs} ${wraps} ${defines} -o malloc32
+gcc -Wall -Wextra -std=gnu17 -DBITMAP_WORD_BITS=64 -g3 -Wall -Wextra ${sources} ${libs} ${wraps} ${defines} -o malloc64
+gcc -Wall -Wextra -O3 -std=gnu17 -DBITMAP_WORD_BITS=64 -g3 -Wall -Wextra ${sources} ${libs} ${wraps} ${defines} -DBADGEROS_MALLOC_DEBUG_LEVEL=1 -o malloc64-nodebug
+gcc -Wall -Wextra -O3 -std=gnu17 -DBITMAP_WORD_BITS=64 -g3 -Wall -Wextra ${sources} ${libs} ${wraps} ${defines} -DBADGEROS_MALLOC_DEBUG_LEVEL=4 -o malloc64-debug
+gcc -Wall -Wextra -std=gnu17 -DBITMAP_WORD_BITS=64 -g3 -Wall -Wextra -fsanitize=address -fsanitize=undefined ${sources} ${libs} ${wraps} ${defines} -o malloc64-san
+gcc -Wall -Wextra -std=gnu17 -DBITMAP_WORD_BITS=32 -DSOFTBIT -g3 -Wall -Wextra ${sources} ${libs} ${wraps} ${defines} -o malloc32-softbit
+gcc -Wall -Wextra -std=gnu17 -DBITMAP_WORD_BITS=64 -DSOFTBIT -g3 -Wall -Wextra ${sources} ${libs} ${wraps} ${defines} -o malloc64-softbit
+
+echo
+echo "BUILD SUCCESFUL"
+echo

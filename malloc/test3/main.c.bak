@@ -1,0 +1,52 @@
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+
+#include "allocator.h"
+
+void *__real_malloc(size_t size);
+void __real_free(void *ptr);
+void *__real_calloc(size_t nmemb, size_t size);
+void *__real_realloc(void *ptr, size_t size);
+void *__real_reallocarray(void *ptr, size_t nmemb, size_t size);
+
+void *alloc(char n, size_t size) {
+	char* t = malloc(size);
+	memset(t, n, size);
+	t[size - 1] = 0;
+
+	return t;
+}
+
+#define MEMORY_SIZE (1024 * 1024 * 1024)
+int main() {
+	char* memory = __real_malloc(MEMORY_SIZE);
+	page_alloc_init(memory, memory + MEMORY_SIZE);
+
+	size_t i = 0;
+	char* page;
+	char* first_page = NULL;
+	char* last_page;
+	while (page = page_alloc()) {
+		i++;
+		last_page = page;
+		if (!first_page) first_page = page;
+	}
+
+	printf("Allocated %zi pages\n", i);
+	printf("Last page: %p\n", last_page);
+
+	page_free(first_page + (5 * 4096));
+	page_free(first_page + (8 * 4096));
+	page_free(first_page + ((i - 10) * 4096));
+
+	page = page_alloc();
+	printf("Page: %p\n", page);
+	page = page_alloc();
+	printf("Page: %p\n", page);
+	page = page_alloc();
+	printf("Page: %p\n", page);
+	page = page_alloc();
+	printf("Page: %p\n", page);
+
+}

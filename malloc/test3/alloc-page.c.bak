@@ -1,0 +1,39 @@
+#include <stddef.h>
+#include <stdint.h>
+
+enum allocator_type {
+	ALLOCATOR_PAGE_EMPTY = 0,
+	ALLOCATOR_PAGE = 1,
+	ALLOCATOR_SLAB = 2,
+	ALLOCATOR_BUDDY = 3
+};
+
+typedef struct allocator_page {
+	uint16_t size;
+	uint16_t realloc_count;
+} allocator_page_t;
+
+typedef struct allocator_slab {
+	uint16_t slab_size;
+} allocator_slab_t;
+
+typedef struct allocator_buddy {
+	struct buddy_allocations {
+		unsigned allocation: 4;
+	} allocations[16];
+} allocator_buddy_t;
+
+typedef struct page {
+	enum allocator_type;
+	union {
+		allocator_page_t page;
+		allocator_slab_t slab;
+		allocator_buddy_t buddy;
+	} allocator_meta;
+} page_t;
+
+typedef struct page_meta {
+	uint32_t num_pages;
+	page_t* page_table;
+} page_meta_t;
+
